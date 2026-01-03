@@ -9,13 +9,19 @@
 #include <time.h>
 #include <errno.h>
 #include <sched.h>
+#include <sys/ioctl.h>
 
 #define DEVICE_PATH "/dev/myQueue"
 #define TOTAL_TASKS 50  // تعداد کل taskها (طبق صورت سوال)
 #define Q_CAP 10        // ظرفیت هر صف
 #define TOTAL_CAP (Q_CAP * 3)  // کل ظرفیت = 30
 
-// ✅ اصلاح: ساختار task با u64 برای سازگاری با kernel
+// ✅ اضافه کردن IOCTL commands (همان‌ها که در kernel تعریف شده)
+#define QUEUE_IOC_MAGIC 'q'
+#define QUEUE_SET_MODE _IOW(QUEUE_IOC_MAGIC, 1, int)
+#define QUEUE_GET_MODE _IOR(QUEUE_IOC_MAGIC, 2, int)
+
+// ساختار task با u64 برای سازگاری با kernel
 struct task {
     int priority;
     int task_id;
@@ -49,6 +55,7 @@ int stats_count = 0;
 // تعداد خوانندگان و هسته‌ها
 int num_readers = 1;
 int num_cores = 1;
+int scheduling_mode = 0;  // ✅ 0=FCFS, 1=Priority
 
 // آرایه برای شمارش task‌های هر اولویت
 int priority_count[3] = {0, 0, 0};
@@ -80,6 +87,17 @@ void simulate_execution(int exec_time_ms) {
     }
 }
 
+// ✅ تابع تنظیم حالت scheduling
+int set_scheduling_mode(int mode) {
+    if (ioctl(fd, QUEUE_SET_MODE, &mode) < 0) {
+        perror("Failed to set scheduling mode");
+        return -1;
+    }
+    printf("[Main] Scheduling mode set to: %s\n", 
+           mode == 0 ? "FCFS" : "Priority-based");
+    return 0;
+}
+
 // تابع تولیدکننده
 void* writer_thread(void* arg) {
     int core_id = *(int*)arg;
@@ -90,9 +108,9 @@ void* writer_thread(void* arg) {
     CPU_SET(core_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     
-    printf("[Writer] Running on core %d\n", core_id);
+    printf("[Writer] Running on core %d (Mode: %s)\n", 
+           core_id, scheduling_mode == 0 ? "FCFS" : "Priority");
     
-    // ✅ اصلاح #5: random بهتر با استفاده از pid
     srand(time(NULL) ^ getpid());
     
     for (int i = 0; i < TOTAL_TASKS; i++) {
@@ -104,7 +122,6 @@ void* writer_thread(void* arg) {
         new_task.priority = rand() % 3;  // 0, 1, 2
         new_task.exec_time = 14 + rand() % 131;  // 14-144 ms
         
-        // ✅ تبدیل timespec به nanoseconds برای سازگاری با kernel
         clock_gettime(CLOCK_MONOTONIC, &ts);
         new_task.arrival_time_ns = timespec_to_ns(&ts);
         
@@ -136,7 +153,6 @@ void* writer_thread(void* arg) {
             }
         }
         
-        // ✅ به‌روزرسانی tasks_produced با mutex
         pthread_mutex_lock(&stats_mutex);
         tasks_produced++;
         pthread_mutex_unlock(&stats_mutex);
@@ -152,7 +168,7 @@ void* writer_thread(void* arg) {
         usleep(delay * 1000);
     }
     
-    // ✅ ارسال Poison Pills برای پایان دادن به readerها
+    // ارسال Poison Pills برای پایان دادن به readerها
     printf("[Writer] Sending poison pills to %d readers...\n", num_readers);
     for (int i = 0; i < num_readers; i++) {
         struct task poison = {
@@ -189,7 +205,8 @@ void* reader_thread(void* arg) {
     CPU_SET(core_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
     
-    printf("[Reader %d] Running on core %d\n", reader_id, core_id);
+    printf("[Reader %d] Running on core %d (Mode: %s)\n", 
+           reader_id, core_id, scheduling_mode == 0 ? "FCFS" : "Priority");
     
     while (1) {
         sem_wait(&full);
@@ -200,7 +217,6 @@ void* reader_thread(void* arg) {
         
         if (ret < 0) {
             if (errno == EAGAIN) {
-                // ✅ اصلاح #1: حذف sem_post(&full) برای جلوگیری از deadlock
                 pthread_mutex_unlock(&queue_mutex);
                 usleep(1000);
                 continue;
@@ -212,7 +228,7 @@ void* reader_thread(void* arg) {
             }
         }
         
-        // ✅ بررسی Poison Pill
+        // بررسی Poison Pill
         if (read_task.task_id == -1) {
             printf("[Reader %d] Received poison pill, exiting...\n", reader_id);
             pthread_mutex_unlock(&queue_mutex);
@@ -235,7 +251,6 @@ void* reader_thread(void* arg) {
         struct timespec finish_time;
         clock_gettime(CLOCK_MONOTONIC, &finish_time);
         
-        // ✅ اصلاح #3: جلوگیری از overflow با چک کردن stats_count
         pthread_mutex_lock(&stats_mutex);
         if (stats_count < TOTAL_TASKS) {
             stats[stats_count].task_id = read_task.task_id;
@@ -261,17 +276,18 @@ void* reader_thread(void* arg) {
     return NULL;
 }
 
-// محاسبه و نمایش نتایج
+// ✅ محاسبه و نمایش نتایج با جزئیات بیشتر
 void print_statistics() {
     printf("\n========================================\n");
     printf("         PERFORMANCE METRICS\n");
+    printf("   Scheduling Mode: %s\n", scheduling_mode == 0 ? "FCFS" : "Priority-based");
     printf("========================================\n\n");
     
     // تعداد task‌های تولیدشده به تفکیک اولویت
     printf("Tasks produced by priority:\n");
-    printf("  Priority 0: %d tasks\n", priority_count[0]);
-    printf("  Priority 1: %d tasks\n", priority_count[1]);
-    printf("  Priority 2: %d tasks\n", priority_count[2]);
+    printf("  Priority 0 (High):   %d tasks\n", priority_count[0]);
+    printf("  Priority 1 (Medium): %d tasks\n", priority_count[1]);
+    printf("  Priority 2 (Low):    %d tasks\n", priority_count[2]);
     printf("  Total: %d tasks\n\n", tasks_produced);
     
     if (stats_count == 0) {
@@ -279,17 +295,25 @@ void print_statistics() {
         return;
     }
     
-    // ✅ اصلاح #4: محاسبه صحیح min_arrival_sec با واحد یکسان
+    // محاسبه آمار کلی
     double min_arrival_sec = stats[0].arrival_time.tv_sec + 
                              stats[0].arrival_time.tv_nsec / 1e9;
     double max_finish_sec = stats[0].finish_time.tv_sec + 
                             stats[0].finish_time.tv_nsec / 1e9;
     
     double total_wait = 0, total_turnaround = 0;
+    double wait_by_priority[3] = {0, 0, 0};
+    double turnaround_by_priority[3] = {0, 0, 0};
+    int count_by_priority[3] = {0, 0, 0};
     
     for (int i = 0; i < stats_count; i++) {
         total_wait += stats[i].wait_time;
         total_turnaround += stats[i].turnaround_time;
+        
+        int prio = stats[i].priority;
+        wait_by_priority[prio] += stats[i].wait_time;
+        turnaround_by_priority[prio] += stats[i].turnaround_time;
+        count_by_priority[prio]++;
         
         double arr = stats[i].arrival_time.tv_sec + stats[i].arrival_time.tv_nsec / 1e9;
         double fin = stats[i].finish_time.tv_sec + stats[i].finish_time.tv_nsec / 1e9;
@@ -305,14 +329,43 @@ void print_statistics() {
     double total_time_sec = max_finish_sec - min_arrival_sec;
     double throughput = stats_count / total_time_sec;
     
+    printf("=== OVERALL STATISTICS ===\n");
     printf("Average Wait Time: %.2f ms\n", avg_wait);
     printf("Average Turnaround Time: %.2f ms\n", avg_turnaround);
     printf("Throughput: %.2f tasks/second\n", throughput);
     printf("Total Execution Time: %.2f seconds\n\n", total_time_sec);
     
+    // ✅ آمار به تفکیک اولویت (تفاوت اصلی FCFS و Priority اینجاست!)
+    printf("=== STATISTICS BY PRIORITY ===\n");
+    for (int p = 0; p < 3; p++) {
+        if (count_by_priority[p] > 0) {
+            printf("Priority %d (%s):\n", p, 
+                   p == 0 ? "High" : (p == 1 ? "Medium" : "Low"));
+            printf("  Tasks completed: %d\n", count_by_priority[p]);
+            printf("  Avg Wait Time: %.2f ms\n", 
+                   wait_by_priority[p] / count_by_priority[p]);
+            printf("  Avg Turnaround Time: %.2f ms\n\n", 
+                   turnaround_by_priority[p] / count_by_priority[p]);
+        }
+    }
+    
+    // ✅ نمایش تفاوت بین اولویت‌ها
+    if (scheduling_mode == 1 && count_by_priority[0] > 0 && count_by_priority[2] > 0) {
+        double high_prio_wait = wait_by_priority[0] / count_by_priority[0];
+        double low_prio_wait = wait_by_priority[2] / count_by_priority[2];
+        printf("*** Priority Scheduling Effect ***\n");
+        printf("High priority wait time: %.2f ms\n", high_prio_wait);
+        printf("Low priority wait time: %.2f ms\n", low_prio_wait);
+        printf("Difference: %.2f ms (%.1fx)\n", 
+               low_prio_wait - high_prio_wait,
+               low_prio_wait / high_prio_wait);
+        printf("(Low priority tasks wait %.1fx longer!)\n\n", 
+               low_prio_wait / high_prio_wait);
+    }
+    
     // محاسبه CPU utilization برای هر reader
     if (num_readers > 1) {
-        printf("CPU Utilization per Reader:\n");
+        printf("=== CPU UTILIZATION PER READER ===\n");
         for (int r = 0; r < num_readers; r++) {
             double cpu_busy_time = 0;
             double first_start = -1, last_finish = -1;
@@ -342,22 +395,33 @@ void print_statistics() {
             cpu_busy_time += stats[i].exec_time;
         }
         double utilization = (cpu_busy_time / (total_time_sec * 1000.0)) * 100.0;
-        printf("CPU Utilization: %.2f%%\n", utilization);
+        printf("=== CPU UTILIZATION ===\n");
+        printf("Total CPU Utilization: %.2f%%\n", utilization);
     }
     
     printf("\n========================================\n");
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <scenario>\n", argv[0]);
-        printf("  scenario 1: Single-Core (1 writer + 1 reader)\n");
-        printf("  scenario 2: Multi-Core (1 writer + 2 readers)\n");
-        printf("  scenario 4: Multi-Core (1 writer + 4 readers)\n");
+    if (argc < 3) {
+        printf("Usage: %s <scenario> <scheduling_mode>\n", argv[0]);
+        printf("  scenario:\n");
+        printf("    1: Single-Core (1 writer + 1 reader)\n");
+        printf("    2: Multi-Core (1 writer + 2 readers)\n");
+        printf("    4: Multi-Core (1 writer + 4 readers)\n");
+        printf("  scheduling_mode:\n");
+        printf("    0: FCFS (First-Come-First-Served)\n");
+        printf("    1: Priority-based\n");
         return 1;
     }
     
     int scenario = atoi(argv[1]);
+    scheduling_mode = atoi(argv[2]);
+    
+    if (scheduling_mode != 0 && scheduling_mode != 1) {
+        printf("Invalid scheduling mode. Use 0 (FCFS) or 1 (Priority)\n");
+        return 1;
+    }
     
     if (scenario == 1) {
         num_readers = 1;
@@ -376,10 +440,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    printf("Scheduling Mode: %s\n\n", scheduling_mode == 0 ? "FCFS" : "Priority-based");
+    
     // باز کردن دستگاه
     fd = open(DEVICE_PATH, O_RDWR);
     if (fd < 0) {
         perror("Failed to open device");
+        return 1;
+    }
+    
+    // ✅ تنظیم حالت scheduling در kernel
+    if (set_scheduling_mode(scheduling_mode) < 0) {
+        close(fd);
         return 1;
     }
     
