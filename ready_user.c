@@ -16,7 +16,7 @@
 #define Q_CAP 10        // ظرفیت هر صف
 #define TOTAL_CAP (Q_CAP * 3)  // کل ظرفیت = 30
 
-// ✅ اضافه کردن IOCTL commands (همان‌ها که در kernel تعریف شده)
+// اضافه کردن IOCTL commands
 #define QUEUE_IOC_MAGIC 'q'
 #define QUEUE_SET_MODE _IOW(QUEUE_IOC_MAGIC, 1, int)
 #define QUEUE_GET_MODE _IOR(QUEUE_IOC_MAGIC, 2, int)
@@ -55,7 +55,7 @@ int stats_count = 0;
 // تعداد خوانندگان و هسته‌ها
 int num_readers = 1;
 int num_cores = 1;
-int scheduling_mode = 0;  // ✅ 0=FCFS, 1=Priority
+int scheduling_mode = 0;  // 0=FCFS, 1=Priority
 
 // آرایه برای شمارش task‌های هر اولویت
 int priority_count[3] = {0, 0, 0};
@@ -87,7 +87,7 @@ void simulate_execution(int exec_time_ms) {
     }
 }
 
-// ✅ تابع تنظیم حالت scheduling
+// تابع تنظیم حالت scheduling
 int set_scheduling_mode(int mode) {
     if (ioctl(fd, QUEUE_SET_MODE, &mode) < 0) {
         perror("Failed to set scheduling mode");
@@ -116,60 +116,83 @@ void* writer_thread(void* arg) {
     for (int i = 0; i < TOTAL_TASKS; i++) {
         struct task new_task;
         struct timespec ts;
+        int retry_count = 0;
         
-        // تولید task تصادفی
+        // تولید task تصادفی - فقط یک بار در ابتدای loop
         new_task.task_id = i;
         new_task.priority = rand() % 3;  // 0, 1, 2
-        new_task.exec_time = 14 + rand() % 131;  // 14-144 ms
+        new_task.exec_time = 100 + rand() % 401;  // 100-500 ms
         
         clock_gettime(CLOCK_MONOTONIC, &ts);
         new_task.arrival_time_ns = timespec_to_ns(&ts);
         
-        // شمارش اولویت‌ها
+        // شمارش اولویت‌ها - فقط یک بار
         pthread_mutex_lock(&priority_mutex);
         priority_count[new_task.priority]++;
         pthread_mutex_unlock(&priority_mutex);
         
-        // همگام‌سازی
-        sem_wait(&empty);
-        pthread_mutex_lock(&queue_mutex);
-        
-        // نوشتن در دستگاه
-        ssize_t ret = write(fd, &new_task, sizeof(struct task));
-        
-        if (ret < 0) {
-            if (errno == EAGAIN) {
-                printf("[Writer] Queue full, retrying...\n");
-                pthread_mutex_unlock(&queue_mutex);
-                sem_post(&empty);
-                i--;  // تلاش دوباره
-                usleep(1000);
-                continue;
-            } else {
-                perror("[Writer] Write failed");
-                pthread_mutex_unlock(&queue_mutex);
-                sem_post(&empty);
-                break;
+        // تلاش برای نوشتن task تا موفق شود
+        while (1) {
+            // همگام‌سازی
+            sem_wait(&empty);
+            pthread_mutex_lock(&queue_mutex);
+            
+            // نوشتن در دستگاه
+            ssize_t ret = write(fd, &new_task, sizeof(struct task));
+            
+            if (ret < 0) {
+                if (errno == EAGAIN) {
+                    retry_count++;
+                    if (retry_count == 1) {
+                        printf("[Writer] Queue full, waiting for space (Task %d)...\n", i);
+                    }
+                    pthread_mutex_unlock(&queue_mutex);
+                    sem_post(&empty);
+                    usleep(1000);  // کمی صبر کن
+                    continue;  // دوباره تلاش کن
+                } else {
+                    perror("[Writer] Write failed");
+                    pthread_mutex_unlock(&queue_mutex);
+                    sem_post(&empty);
+                    return NULL;
+                }
             }
+            
+            // نوشتن موفق بود
+            pthread_mutex_lock(&stats_mutex);
+            tasks_produced++;
+            pthread_mutex_unlock(&stats_mutex);
+            
+            printf("[Writer] Task %d produced (Priority=%d, ExecTime=%d ms)%s\n",
+                   new_task.task_id, new_task.priority, new_task.exec_time,
+                   retry_count > 0 ? " [after retry]" : "");
+            
+            pthread_mutex_unlock(&queue_mutex);
+            sem_post(&full);
+            break;  // از while خارج شو
         }
         
-        pthread_mutex_lock(&stats_mutex);
-        tasks_produced++;
-        pthread_mutex_unlock(&stats_mutex);
-        
-        printf("[Writer] Task %d produced (Priority=%d, ExecTime=%d ms)\n",
-               new_task.task_id, new_task.priority, new_task.exec_time);
-        
-        pthread_mutex_unlock(&queue_mutex);
-        sem_post(&full);
-        
-        // تاخیر تصادفی بین تولید task‌ها
-        int delay = 14 + rand() % 131;
+        // تاخیر تصادفی بین تولید task‌ها: 10-100 ms
+        int delay = 10 + rand() % 91;
         usleep(delay * 1000);
     }
     
+    // صبر کن تا همه taskها مصرف بشن
+    printf("[Writer] Waiting for all tasks to be consumed...\n");
+    while (1) {
+        pthread_mutex_lock(&stats_mutex);
+        int consumed = tasks_consumed;
+        pthread_mutex_unlock(&stats_mutex);
+        
+        if (consumed >= TOTAL_TASKS) {
+            break;
+        }
+        usleep(100000);  // 100ms
+    }
+    
+    printf("[Writer] All tasks consumed. Sending poison pills to %d readers...\n", num_readers);
+    
     // ارسال Poison Pills برای پایان دادن به readerها
-    printf("[Writer] Sending poison pills to %d readers...\n", num_readers);
     for (int i = 0; i < num_readers; i++) {
         struct task poison = {
             .task_id = -1,
@@ -276,7 +299,7 @@ void* reader_thread(void* arg) {
     return NULL;
 }
 
-// ✅ محاسبه و نمایش نتایج با جزئیات بیشتر
+// محاسبه و نمایش نتایج با جزئیات بیشتر
 void print_statistics() {
     printf("\n========================================\n");
     printf("         PERFORMANCE METRICS\n");
@@ -335,7 +358,7 @@ void print_statistics() {
     printf("Throughput: %.2f tasks/second\n", throughput);
     printf("Total Execution Time: %.2f seconds\n\n", total_time_sec);
     
-    // ✅ آمار به تفکیک اولویت (تفاوت اصلی FCFS و Priority اینجاست!)
+    // آمار به تفکیک اولویت
     printf("=== STATISTICS BY PRIORITY ===\n");
     for (int p = 0; p < 3; p++) {
         if (count_by_priority[p] > 0) {
@@ -349,7 +372,7 @@ void print_statistics() {
         }
     }
     
-    // ✅ نمایش تفاوت بین اولویت‌ها
+    // نمایش تفاوت بین اولویت‌ها
     if (scheduling_mode == 1 && count_by_priority[0] > 0 && count_by_priority[2] > 0) {
         double high_prio_wait = wait_by_priority[0] / count_by_priority[0];
         double low_prio_wait = wait_by_priority[2] / count_by_priority[2];
@@ -440,7 +463,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    printf("Scheduling Mode: %s\n\n", scheduling_mode == 0 ? "FCFS" : "Priority-based");
+    printf("Scheduling Mode: %s\n", scheduling_mode == 0 ? "FCFS" : "Priority-based");
+    printf("Task exec_time: 100-500 ms\n");
+    printf("Writer delay: 10-100 ms\n\n");
     
     // باز کردن دستگاه
     fd = open(DEVICE_PATH, O_RDWR);
@@ -449,7 +474,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    // ✅ تنظیم حالت scheduling در kernel
+    // تنظیم حالت scheduling در kernel
     if (set_scheduling_mode(scheduling_mode) < 0) {
         close(fd);
         return 1;
